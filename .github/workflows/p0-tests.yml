@@ -37,6 +37,9 @@ on:
       - 'test_korean_omission.py'
       - 'ocr_batch.py'
       - 'region_text.py'
+      - 'artwork_copy_checker.py'
+      - 'artwork_copy_reference.py'
+      - 'test_artwork_copy_checker.py'
       - '.github/workflows/p0-tests.yml'
   workflow_dispatch:
 
