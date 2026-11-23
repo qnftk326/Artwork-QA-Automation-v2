@@ -20,7 +20,7 @@ class ArtworkCopyCheckerTests(unittest.TestCase):
 
     def test_empty_korean_reference_is_not_marked_missing(self):
         results = check_artwork({"sample.pdf": {
-            "native": "Tefal is a registered trademark of Tefal S.A.S.",
+            "native": "Tefal is a registered trademark of Tefal S.A.S. FRANCE -15 Avenue des Alpes - ZAE Rumilly Est - BP 89 - 74150 RUMILLY - France – R.C.S. Annecy B 301 520 920 www.tefal.com",
             "ocr": "",
         }})
         distributor = results[-1]
