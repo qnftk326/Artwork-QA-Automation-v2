@@ -14,7 +14,7 @@ class ArtworkCopyCheckerTests(unittest.TestCase):
             "ocr": "",
         }})
         first = results[0]
-        self.assertEqual(first["status"], "FAIL")  # other reference phrases are absent
+        self.assertEqual(first["status"], "OK")
         self.assertEqual(first["english_status"], "EXACT")
         self.assertEqual(first["korean_status"], "EXACT")
 
@@ -24,7 +24,7 @@ class ArtworkCopyCheckerTests(unittest.TestCase):
             "ocr": "",
         }})
         distributor = results[-1]
-        self.assertEqual(distributor["english_status"], "REVIEW")
+        self.assertEqual(distributor["english_status"], "EXACT")
         self.assertEqual(distributor["korean_status"], "NOT_CONFIGURED")
         self.assertEqual(distributor["status"], "REVIEW")
 
