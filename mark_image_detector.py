@@ -1,0 +1,345 @@
+"""Raster evidence for Tefal artwork logos/QR marks.
+
+No company PDF, logo screenshot, or template is shipped with the source.
+OpenCV detects an actual QR finder/code pattern in rendered PDF pixels.
+Other logo classes are conservative *visual candidates*: native printed
+anchors yield small image crops for review, never automatic logo presence.
+"""
+import io
+import re
+
+import fitz
+from visual_marks import clean_and_detect
+
+MARKS = (
+    ("TEFAL_COMMITMENTS_QR", "테팔 커미트먼트 QR"),
+    ("USE_CARE_QR", "사용방법 QR"),
+    ("RECYCLING", "재활용 마크"),
+    ("WORLD_NO1", "세계 1위 엠블럼"),
+    ("INDUCTION", "인덕션 아이콘"),
+    ("MADE_IN_FRANCE", "Made in France 배지"),
+)
+
+ANCHORS = {
+    "TEFAL_COMMITMENTS_QR": ("COMMITMENTS", "COMMITMENT"),
+    "USE_CARE_QR": ("SCAN", "USE & CARE", "USE AND CARE", "QR"),
+    "RECYCLING": ("RECYCLABLE", "RECYCLING", "재활용", "RECYCLABLE METAL"),
+    "WORLD_NO1": ("WORLD N", "WORLD", "세계판매", "세계 판매"),
+    "INDUCTION": ("ALL HOBS", "INDUCTION", "인덕션"),
+    "MADE_IN_FRANCE": ("MADE IN FRANCE", "FABRIQUÉ EN FRANCE"),
+}
+
+
+def _compact_rect(box, page):
+    if box is None:
+        return None
+    r=fitz.Rect(box) & page.rect
+    return r if not r.is_empty else None
+
+
+def _near_anchor(anchor, rect, radius=145):
+    a=fitz.Rect(anchor)
+    dx=max(0, rect.x0-a.x1, a.x0-rect.x1)
+    dy=max(0, rect.y0-a.y1, a.y0-rect.y1)
+    return dx <= radius and dy <= radius
+
+
+def _anchors(page, terms):
+    result=[]
+    for term in terms:
+        try:
+            found=page.search_for(term)
+        except (ValueError, RuntimeError):
+            found=[]
+        for rect in found:
+            if not any(abs(old.x0-rect.x0)<2 and abs(old.y0-rect.y0)<2
+                       for old in result):
+                result.append(rect)
+    return result
+
+
+def _qr_in_crop(page, region, scale, detector):
+    import cv2
+    import numpy as np
+    region=_compact_rect(region,page)
+    if region is None:
+        return []
+    pix=page.get_pixmap(clip=region,
+                        matrix=fitz.Matrix(scale,scale),
+                        colorspace=fitz.csGRAY,alpha=False)
+    pixels=np.frombuffer(pix.samples,dtype=np.uint8).reshape(pix.height,pix.width)
+    results=[]
+    # Use detectMulti to include codes which cannot be decoded because of
+    # print noise. A QR finder must be present (not a text guess).
+    try:
+        present, points=detector.detectMulti(pixels)
+    except cv2.error:
+        present,points=False,None
+    if not present or points is None:
+        return []
+    for corners in points:
+        bbox=[
+            region.x0+float(corners[:,0].min())/scale,
+            region.y0+float(corners[:,1].min())/scale,
+            region.x0+float(corners[:,0].max())/scale,
+            region.y0+float(corners[:,1].max())/scale,
+        ]
+        text=""
+        try:
+            text,_,_=detector.detectAndDecode(pixels[
+                max(0,int(corners[:,1].min())-12):min(pixels.shape[0],int(corners[:,1].max())+13),
+                max(0,int(corners[:,0].min())-12):min(pixels.shape[1],int(corners[:,0].max())+13)])
+        except (cv2.error,ValueError):
+            pass
+        results.append({"bbox":bbox,"decoded":text or "",
+                        "method":"raster_qr_finder","confidence":"DETECTED"})
+    return results
+
+
+def _qr_candidates(page):
+    """Zoom around native anchor words; tiny QR codes evade full-page scans."""
+    try:
+        import cv2
+    except ImportError:
+        return []
+    decoder=cv2.QRCodeDetector()
+    areas=[]
+    for token in ("COMMITMENTS","SCAN","QR","USE & CARE"):
+        for anchor in _anchors(page,(token,)):
+            # Include codes directly above or next to their label.
+            areas.append((token,anchor,fitz.Rect(
+                anchor.x0-125,anchor.y0-100,anchor.x1+115,anchor.y1+95)))
+    unique=[]
+    for token,anchor,region in areas:
+        if len(unique)>=16:
+            break
+        for result in _qr_in_crop(page,region,3.5,decoder):
+            box=fitz.Rect(result["bbox"])
+            if any(abs(box.x0-fitz.Rect(old["bbox"]).x0)<8
+                   and abs(box.y0-fitz.Rect(old["bbox"]).y0)<8
+                   for old in unique):
+                continue
+            result["anchor"]=token
+            unique.append(result)
+    # Labels can be flattened into the artwork or encoded as vector paths;
+    # scan the rendered full page as a fallback instead of declaring no QR.
+    if not unique and page.rect.width*page.rect.height < 4_000_000:
+        for result in _qr_in_crop(page,page.rect,1.8,decoder):
+            box=fitz.Rect(result["bbox"])
+            if any(abs(box.x0-fitz.Rect(old["bbox"]).x0)<8 and
+                   abs(box.y0-fitz.Rect(old["bbox"]).y0)<8 for old in unique):
+                continue
+            result["anchor"]="full_page_visual_scan"
+            unique.append(result)
+    return unique
+
+
+def _world_badge_pixels(page, rect):
+    """Require BOTH 'WORLD' native glyphs and a compact saturated red badge.
+
+    A plain WORLD text label, even next to a logo, is not enough. A positively
+    observed red artwork panel with text inside it is a stronger pixel match.
+    """
+    import cv2
+    import numpy as np
+    rect=fitz.Rect(rect)
+    clip=fitz.Rect(rect.x0-18,rect.y0-18,
+                   rect.x1+22,rect.y1+24) & page.rect
+    if clip.is_empty:
+        return False
+    pix=page.get_pixmap(clip=clip,matrix=fitz.Matrix(1.5,1.5),
+                        colorspace=fitz.csRGB,alpha=False)
+    rgb=np.frombuffer(pix.samples,dtype=np.uint8).reshape(pix.height,pix.width,3)
+    hsv=cv2.cvtColor(rgb,cv2.COLOR_RGB2HSV)
+    red=(cv2.inRange(hsv,np.array((0,100,90),dtype=np.uint8),
+                     np.array((12,255,255),dtype=np.uint8)) |
+         cv2.inRange(hsv,np.array((170,100,90),dtype=np.uint8),
+                     np.array((179,255,255),dtype=np.uint8)))
+    return float(np.count_nonzero(red))/(red.size or 1) >= .16
+
+
+def _recycling_pixel_candidates(page):
+    """Find plausible compact green circular recycling pictograms in pixels.
+
+    This is shape evidence, not proof of recycling semantics. Keep REVIEW.
+    Vector logos embedded in PDF still appear in the rendered raster image.
+    """
+    import cv2
+    import numpy as np
+    render_scale=min(1.15,max(0.55,1500/max(page.rect.width,page.rect.height)))
+    pix=page.get_pixmap(matrix=fitz.Matrix(render_scale,render_scale),
+                        colorspace=fitz.csRGB,alpha=False)
+    pixels=np.frombuffer(pix.samples,dtype=np.uint8).reshape(
+        pix.height,pix.width,3)
+    hsv=cv2.cvtColor(pixels,cv2.COLOR_RGB2HSV)
+    mask=cv2.inRange(hsv,np.array((30,35,20),dtype=np.uint8),
+                     np.array((95,255,240),dtype=np.uint8))
+    contours,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+    found=[]
+    for contour in contours:
+        x,y,w,h=cv2.boundingRect(contour)
+        if not (18*render_scale <= w <= 105*render_scale and
+                18*render_scale <= h <= 105*render_scale):
+            continue
+        if not (.74<=w/h<=1.32):
+            continue
+        filled=cv2.contourArea(contour)/(w*h)
+        if not (.55<=filled<=.90):
+            continue
+        bbox=[x/render_scale,y/render_scale,(x+w)/render_scale,(y+h)/render_scale]
+        found.append(dict(bbox=bbox,method="green_circular_pixel_candidate"))
+    return sorted(found,key=lambda x:(x["bbox"][1],x["bbox"][0]))[:15]
+
+
+def detect_pdf_marks(pdf_bytes, filename, metadata=None, max_pixels=30_000_000):
+    """Return conservative per-page mark evidence with PDF coordinates.
+
+    Status DETECTED means QR pixels actually formed a finder/code pattern.
+    Candidate marks do NOT mean a verified recycling, no.1 or origin logo.
+    Absence of a detected QR/mark is always NOT_VERIFIED, not 'absent'.
+    """
+    metadata=metadata or {}
+    findings=[]
+    with fitz.open(stream=pdf_bytes,filetype="pdf") as doc:
+        for page in doc:
+            if page.rect.width*page.rect.height > max_pixels:
+                # Unusually huge vector pages can be rendered locally by
+                # a human. Do not blow worker memory on unbounded artboards.
+                continue
+            qr=_qr_candidates(page)
+            commitment_anchors=_anchors(page,ANCHORS["TEFAL_COMMITMENTS_QR"])
+            care_anchors=_anchors(page,ANCHORS["USE_CARE_QR"])
+            for item in qr:
+                region=fitz.Rect(item["bbox"])
+                commitment=any(_near_anchor(a,region,100) for a in commitment_anchors)
+                care=any(_near_anchor(a,region,95) for a in care_anchors)
+                if not commitment and not care:
+                    # Check native lettering close to the *detected* QR;
+                    # unlike the removed logo logic, this does not create a
+                    # QR candidate from text alone.
+                    around=fitz.Rect(region.x0-80,region.y0-60,
+                                     region.x1+100,region.y1+70)&page.rect
+                    surrounding=page.get_textbox(around).upper()
+                    commitment=bool(re.search(r"COMMITMENTS?",surrounding))
+                    care=bool(re.search(r"USE\s*(?:&|AND)\s*CARE|SCAN",surrounding))
+                # A QR near the commitment banner is not necessarily the
+                # separate use/care QR on another panel.
+                code="TEFAL_COMMITMENTS_QR" if commitment else (
+                    "USE_CARE_QR" if care else "UNKNOWN_QR")
+                findings.append(dict(file=filename,page=page.number+1,
+                    code=code,label=dict(MARKS).get(code,"기타 QR"),
+                    status="DETECTED",bbox=item["bbox"],method="qr_pixels",
+                    decoded=item["decoded"],finding="QR 코드 이미지 확인됨"))
+            # Previous code treated textual mentions, barcode fragments and
+            # unrelated red print as logos. Only pixel-based shapes survive.
+            page_hits = [hit for hit in findings if hit["page"]==page.number+1]
+            findings = [hit for hit in findings if hit["page"]!=page.number+1]
+            findings.extend(clean_and_detect(page,filename,page_hits,metadata))
+
+    return findings
+
+
+def review_mark_rules(findings, summaries, metadata, filename, matches=None):
+    """Evidence-based logo and conditional copy audit.
+
+    Candidate != confirmed logo. Missing visual evidence is REVIEW, never
+    fabricated as absence. Evaluate the corresponding copy only on a
+    positively identified emblem.
+    """
+    in_file=[f for f in findings if f.get("file")==filename]
+    native=" ".join(str(line.get("text","")) for sm in summaries
+                    if sm.get("file")==filename
+                    for line in sm.get("raw_evidence",[]))
+    ko=" ".join(str(m.get("extracted","")) for m in (matches or [])
+                if m.get("file")==filename)
+    all_text=native+" "+ko
+    product=next((m for m in metadata if m.get("file")==filename),{})
+    identity=" ".join(str(product.get(k,"")) for k in
+                      ("product_type","product_name","description","range","product_type_en"))
+    lid=bool(re.search(r"glass\\s*lid|with\\s*lid|뚜껑\\s*포함|유리\\s*뚜껑",identity,re.I))
+    country=str(product.get("manufacturing_country","")).upper()
+    results=[]
+    for code,label in MARKS:
+        if code=="MADE_IN_FRANCE" and country!="FRANCE":
+            continue
+        hits=[f for f in in_file if f.get("code")==code]
+        definite=[f for f in hits if f.get("status")=="DETECTED"]
+        confirmed=bool(definite)
+        status="REVIEW"
+        notes=[]
+        if confirmed:
+            status="OK"
+        elif hits:
+            notes.append("마크 후보만 존재 · 원본 이미지 확인 필요")
+        else:
+            notes.append("마크 이미지 미확인 · 실제 부재 여부 확인 필요")
+        if code=="MADE_IN_FRANCE":
+            notes.append("제조국 FRANCE 조건부 필수")
+            if not confirmed:
+                status="REVIEW"
+        if code=="INDUCTION":
+            # Explicit exclusion is a valid NOT_APPLICABLE pass, not a
+            # missing-logo review. This applies even if no logo was detected.
+            excluded=bool(re.search(
+                r"ALL\\s+HOBS\\s+EXCEPT\\s+INDUCTION|"
+                r"인덕션\\s*사용\\s*불가|"
+                r"except\\s+induction",all_text,re.I))
+            if excluded and not hits:
+                status="OK"
+                notes=["인덕션 사용 불가 제품 · IH 마크 불필요 (정상)"]
+            elif excluded and hits:
+                status="REVIEW"
+                notes.append("인덕션 사용 불가인데 IH 이미지 후보 검출 · 충돌 확인")
+            elif re.search(r"ALL\\s+HOBS\\s*\\+\\s*INDUCTION",all_text,re.I):
+                notes.append("인덕션 사용 가능 문구 확인 · IH 로고 별도 확인")
+        if code=="INDUCTION_DISABLED_SENTINEL":
+            pass
+        if code=="RECYCLING" and confirmed:
+            variants=[
+                bool(re.search(r"적절한\\s*분리배출\\s*및\\s*적합한\\s*시설에서\\s*처리\\s*시?\\s*재활용\\s*가능\\.",all_text)),
+                bool(re.search(r"적절한\\s*분리배출\\s*및\\s*적합한\\s*시설에서\\s*처리\\s*시\\s*재활용\\s*가능합니다?\\.\\s*\\(유리\\s*뚜껑\\s*제외\\)",all_text))]
+            if sum(variants)!=1:
+                status="FAIL" if sum(variants)==0 else "CONFLICT"
+                notes.append("재활용 안내 문구 1종 필수 · 누락 또는 중복")
+            elif lid and not variants[1]:
+                status="REVIEW"
+                notes.append("유리뚜껑 제품: 유리뚜껑 제외 문구 필요")
+            elif not lid and variants[1]:
+                status="REVIEW"
+                notes.append("뚜껑 정보 재확인: 유리뚜껑 제외 문구 발견")
+        if code=="WORLD_NO1" and confirmed:
+            en=re.search(r"Tefal\\s+world\\s+N[°ºo]?\\s*1\\s+in\\s+cookware",native,re.I)
+            en_years=re.search(r"Home\\s+and\\s+Garden\\s+(20\\d{2})\\s+edition.*?RSP\\s*,?\\s*(20\\d{2})\\s+data",native,re.I|re.S)
+            ko_years=re.search(r"테팔\\s*세계\\s*판매\\s*1\\s*위.*?Home\\s+and\\s+Garden\\s+(20\\d{2})\\s*에디션.*?(20\\d{2})\\s*기준",all_text,re.I|re.S)
+            if not (en and en_years and ko_years):
+                status="REVIEW"
+                notes.append("국·영문 Euromonitor 출처/숫자 원본 대조 필요")
+            elif en_years.groups()!=ko_years.groups():
+                status="FAIL"
+                notes.append("영문·국문 에디션 연도 또는 기준연도 불일치")
+            else:
+                notes.append("에디션 "+en_years.group(1)+" / 매출 기준 "+en_years.group(2))
+        if code=="USE_CARE_QR" and not confirmed:
+            notes.append("사용방법 QR은 슬리브 적용 여부에 따라 필수")
+        results.append(dict(
+            file=filename,rule_id="IMG-"+code,category="마크·QR",
+            rule_type="IMAGE_CONDITIONAL",condition="Excel 원장 + 11/09 회의",
+            min_count=1 if code=="MADE_IN_FRANCE" else 0,max_count=1,
+            found_occurrences=len(definite),distinct_variants=len(hits),
+            matched_phrase_ids=[],review_candidates=[],
+            applicability=("NOT_APPLICABLE" if code=="INDUCTION" and status=="OK" and not hits else ("APPLICABLE" if confirmed else "UNDETERMINED")),
+            status=status,
+            finding=label+(" 이미지 확인" if confirmed else " 이미지 미확인")+" · "+" · ".join(notes),
+            source_reference="PDF raster + Excel/meeting criteria",
+            image_evidence=hits))
+    return results
+
+def preview_mark(pdf_bytes, page_no, bbox, scale=3.0):
+    """PNG evidence only; no files persisted."""
+    with fitz.open(stream=pdf_bytes,filetype="pdf") as doc:
+        page=doc[int(page_no)-1]
+        r=fitz.Rect(bbox)
+        margin=max(12,min(r.width,r.height)*.45)
+        clip=fitz.Rect(r.x0-margin,r.y0-margin,r.x1+margin,r.y1+margin) & page.rect
+        pix=page.get_pixmap(clip=clip,matrix=fitz.Matrix(scale,scale),alpha=False)
+        return pix.tobytes("png")

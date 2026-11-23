@@ -1,0 +1,274 @@
+"""Synthetic BUG-03 tests: no internal artwork is committed."""
+import unittest
+import fitz
+from extractor import (
+    numeric_tokens, numeric_evidence_disagrees, repair_damaged_native,
+    source_citation_prefix, merge_source_citation, korean_segment, numeric_peer_for,
+    extract_pdf,
+)
+from layout import group_paragraphs
+
+
+def fake_line(text):
+    return {"spans": [{"chars": [
+        {"c": c, "bbox": [i * 6, 0, (i + 1) * 6, 8]}
+        for i, c in enumerate(text)
+    ]}]}
+
+
+class WholeDocumentPageTests(unittest.TestCase):
+    def test_default_extraction_reads_every_page_after_twenty(self):
+        document = fitz.open()
+        for number in range(23):
+            page = document.new_page(width=240, height=150)
+            page.insert_text((20, 40), "page " + str(number + 1))
+        data = document.tobytes()
+        document.close()
+        rows, summaries = extract_pdf(data, "multipage.pdf")
+        self.assertEqual(len(summaries), 23)
+        self.assertEqual(summaries[-1]["page"], 23)
+        with self.assertRaisesRegex(ValueError, "최대 페이지 수"):
+            extract_pdf(data, "multipage.pdf", max_pages=20)
+
+class NumericPipelineTests(unittest.TestCase):
+    def test_ocr_does_not_insert_partial_fraction(self):
+        original = "��/�� 스테인리스�스틸로 완성된 내구성"
+        revised, repairs = repair_damaged_native(
+            original, "18/10 스테인리스 스틸로 완성된 내구성"
+        )
+        self.assertEqual(revised, original)
+        self.assertNotIn("스테인리스10스틸로", revised)
+        self.assertTrue(repairs)
+
+    def test_units_normalized_without_false_alarms(self):
+        for phrase in ("40%", "18/10", "2025", "3배", "10년",
+                       "1위", "16cm", "1.7L", "4개", "2 YEARS", "No.1"):
+            self.assertTrue(numeric_tokens(phrase), phrase)
+            self.assertFalse(numeric_evidence_disagrees(phrase, phrase))
+        self.assertTrue(numeric_evidence_disagrees("최대 40% 수납", "최대 409 수납"))
+        # A missing percent sign in OCR is a numeric mismatch.
+        self.assertTrue(numeric_evidence_disagrees("최대 40% 수납", "최대 30% 수납"))
+
+    def test_numeric_prefix_preserved(self):
+        self.assertEqual(korean_segment(fake_line("18/10 스테인리스"))[1],
+                         "18/10 스테인리스")
+        self.assertEqual(korean_segment(fake_line("2025 기준"))[1],
+                         "2025 기준")
+
+    def test_thai_translation_after_euromonitor_is_excluded(self):
+        source = (
+            "테팔 세계판매 1위 주방용품. Euromonitor International Limited, "
+            "Home and Garden 2026 에디션, 주방용품 카테고리 브랜드 매출, "
+            "2025 기준 / ทีฟาล์วอันดับหนึ่งในโลกด้านผลิตภัณฑ์อุปกรณ์ที่ใช้"
+            "ประกอบอาหารบนเตา. ที่มา:"
+        )
+        extracted = korean_segment(fake_line(source))
+        self.assertIsNotNone(extracted)
+        self.assertEqual(
+            extracted[1],
+            "테팔 세계판매 1위 주방용품. Euromonitor International Limited, "
+            "Home and Garden 2026 에디션, 주방용품 카테고리 브랜드 매출, 2025 기준",
+        )
+        self.assertNotIn("ทีฟาล์ว", extracted[1])
+        self.assertEqual(len(extracted[0]), len(extracted[1]))
+
+    def test_other_language_translation_is_not_in_korean_result(self):
+        for foreign in (
+            "ภาษาไทย", "中文內容", "日本語の翻訳", "النص العربي",
+            "Vietnamese translation", "Русский текст",
+        ):
+            source = "가스레인지 사용 가능 / " + foreign
+            result = korean_segment(fake_line(source))
+            self.assertEqual(result[1], "가스레인지 사용 가능", foreign)
+
+    def test_korean_numeric_fraction_slash_remains_intact(self):
+        for source in ("18/10 스테인리스 스틸", "최대 40% 수납", "2025 기준"):
+            self.assertEqual(korean_segment(fake_line(source))[1], source)
+
+    def test_citation_fragments_need_real_source(self):
+        quote, warnings = source_citation_prefix(
+            "Limited, Home and Garden 2026 에디션, 브랜드 매출, 2025 기준",
+            "English footnote: Euromonitor International"
+        )
+        self.assertEqual(quote, "Euromonitor International Limited, Home and Garden 2026")
+        self.assertFalse(warnings)
+        partial, warnings = source_citation_prefix(
+            "Limited, Home and Garden 2026 에디션", ""
+        )
+        self.assertEqual(partial, "Limited, Home and Garden 2026")
+        self.assertTrue(warnings)
+
+    def test_source_year_overlap_appears_once(self):
+        source = "Euromonitor International Limited, Home and Garden 2026"
+        raw = "Limited, Home and Garden 2026 에디션, 판매 기준"
+        merged = merge_source_citation(source, "2026 에디션, 판매 기준", raw)
+        self.assertEqual(
+            merged, "Euromonitor International Limited, Home and Garden 2026 에디션, 판매 기준"
+        )
+        self.assertNotIn("2026 2026", merged)
+
+    def test_real_second_year_must_not_be_removed(self):
+        source = "Euromonitor International Limited, Home and Garden 2026"
+        raw = "Limited, Home and Garden 2026 2026 에디션, 판매 기준"
+        merged = merge_source_citation(source, "2026 에디션, 판매 기준", raw)
+        self.assertEqual(merged.count("2026"), 2)
+
+    def test_other_citation_years_not_hardcoded(self):
+        source = "Independent Market Report 2031"
+        raw = "Independent Market Report 2031 에디션 기준"
+        self.assertEqual(
+            merge_source_citation(source, "2031 에디션 기준", raw),
+            "Independent Market Report 2031 에디션 기준",
+        )
+
+    def test_split_number_is_evidence_not_auto_insert(self):
+        row = {
+            "korean_text": "최대 수납 공간 절약",
+            "x0": 100, "y0": 100, "x1": 200, "y1": 112,
+            "dir_x": 1, "dir_y": 0, "font_size": 10
+        }
+        nearby = [{
+            "id": "p1:b3:l2", "text": "40%", "bbox": [205,100,230,112],
+            "font_size": 10, "direction": [1, 0]
+        }, {
+            "id": "p1:b4:l0", "text": "90%", "bbox": [800,800,830,810],
+            "font_size": 10, "direction": [1, 0]
+        }]
+        self.assertEqual(
+            [e["text"] for e in numeric_peer_for(row, nearby)], ["40%"]
+        )
+        self.assertEqual(row["korean_text"], "최대 수납 공간 절약")
+
+    def test_damaged_number_prefix_is_never_silently_dropped(self):
+        for text, prefix in [
+            ("��% 수납 공간 절약", "��%"),
+            ("��/�� 스테인리스 스틸", "��/��"),
+        ]:
+            value = korean_segment(fake_line(text))
+            self.assertIsNotNone(value)
+            self.assertTrue(value[1].startswith(prefix), value[1])
+
+    def test_wrapped_percent_claim_keeps_review(self):
+        common = {
+            "file": "sample.pdf", "page": 1, "block_id": 4,
+            "curved": False, "dir_x": 1, "dir_y": 0,
+            "font_size": 10, "y0": 100, "y1": 112,
+            "status": "원본 추출 정상", "warnings": [],
+            "numeric_review": False, "ocr_candidate": "",
+            "native_numeric_tokens": [], "raw_evidence_ids": [],
+        }
+        left = dict(common, korean_text="최대", x0=500, x1=530,
+                    line_id=0, baseline_y=110)
+        right = dict(common, korean_text="��% 수납", x0=100, x1=165,
+                     y0=112, y1=124, line_id=1, baseline_y=122,
+                     status="수치 대조 필요 · 원본 확인",
+                     warnings=["수치 대조 필요 · 원본 확인"],
+                     numeric_review=True)
+        joined = group_paragraphs([left, right])
+        self.assertEqual(len(joined), 1)
+        self.assertIn("최대 ��% 수납", joined[0]["paragraph"])
+        self.assertTrue(joined[0]["numeric_review"])
+
+    def test_standalone_maximum_explains_unresolved_link(self):
+        row = {
+            "file": "sample.pdf", "page": 1, "block_id": 4,
+            "line_id": 5, "korean_text": "최대",
+            "curved": False, "font_size": 10,
+            "dir_x": 1, "dir_y": 0,
+            "x0": 200, "y0": 100, "x1": 220, "y1": 111,
+            "status": "수치 대조 필요 · 숫자 객체 연결 확인",
+            "numeric_review": True,
+            "numeric_peer_evidence": [{"text": "40%", "bbox": [230, 100, 255, 111]}],
+        }
+        group = group_paragraphs([row])[0]
+        self.assertEqual(group["paragraph"], "최대")
+        self.assertEqual(group["type"], "문장 연결 확인")
+        self.assertIn("문장 연결 확인 필요", group["status"])
+        self.assertTrue(group["numeric_review"])
+        self.assertEqual(group["numeric_peer_evidence"][0]["text"], "40%")
+        self.assertEqual(row["korean_text"], "최대")
+
+    def test_native_three_object_storage_claim_reconstructed(self):
+        common = dict(file="mint.pdf", page=1, curved=False, dir_x=1, dir_y=0,
+                      block_id=1, line_id=0, status="원본 추출 정상",
+                      warnings=[], numeric_review=False, ocr_candidate="",
+                      native_numeric_tokens=[], raw_evidence_ids=[],
+                      numeric_peer_evidence=[], font_size=10)
+        maximum = dict(common, korean_text="최대", x0=1456.50, y0=848.80,
+                       x1=1475.45, y1=859.04, block_id=59)
+        phrase = dict(common, korean_text="수납 공간 절약",
+                      x0=1426.22, y0=861.25, x1=1540.41, y1=893.85,
+                      block_id=47)
+        summary = dict(file="mint.pdf", page=1, raw_evidence=[
+            dict(id="p1:b48:l0", text="40%",
+                 bbox=[1479.60,817.41,1538.90,873.80]),
+            dict(id="p1:b46:l0", text="40%",
+                 bbox=[838.86,787.80,898.16,844.19]),
+        ])
+        groups = group_paragraphs([maximum,phrase], raw_summaries=[summary])
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["paragraph"], "최대 40% 수납 공간 절약")
+        self.assertEqual(len(groups[0]["source_coordinates"]), 3)
+        self.assertIn("p1:b48:l0", groups[0]["raw_evidence_ids"])
+        self.assertNotIn("p1:b46:l0", groups[0]["raw_evidence_ids"])
+        self.assertFalse(groups[0]["numeric_review"])
+
+    def test_no_native_number_keeps_maximum_without_fabricated_content(self):
+        common = dict(file="mint.pdf", page=1, curved=False, dir_x=1, dir_y=0,
+                      block_id=1, line_id=0, status="원본 추출 정상",
+                      warnings=[], numeric_review=False, ocr_candidate="",
+                      native_numeric_tokens=[], raw_evidence_ids=[],
+                      numeric_peer_evidence=[], font_size=10)
+        maximum=dict(common, korean_text="최대", x0=1456,y0=848,
+                     x1=1475,y1=859)
+        phrase=dict(common, korean_text="수납 공간 절약",
+                    x0=1426,y0=861,x1=1540,y1=894,block_id=2)
+        groups=group_paragraphs([maximum,phrase],raw_summaries=[
+            dict(file="mint.pdf",page=1,raw_evidence=[])])
+        self.assertEqual(len(groups),2)
+        self.assertEqual(groups[0]["paragraph"],"최대")
+        self.assertEqual(groups[1]["paragraph"],"수납 공간 절약")
+
+    def test_maximum_joins_only_adjacent_following_claim(self):
+        base = {
+            "file": "sample.pdf", "page": 1,
+            "curved": False, "font_size": 10, "dir_x": 1, "dir_y": 0,
+            "status": "원본 추출 정상", "numeric_review": False,
+        }
+        left = dict(base, block_id=1, line_id=0,
+                    korean_text="최대", x0=100, y0=100, x1=123, y1=110)
+        right = dict(base, block_id=2, line_id=0,
+                     korean_text="��% 수납 공간 절약", x0=127, y0=100, x1=250, y1=110,
+                     numeric_review=True, status="수치 대조 필요 · 원본 확인")
+        merged = group_paragraphs([left, right])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["paragraph"], "최대 ��% 수납 공간 절약")
+        self.assertIn("수치", merged[0]["status"])
+        far = dict(right, x0=620, x1=740)
+        separate = group_paragraphs([left, far])
+        self.assertEqual(len(separate), 2)
+        unrelated = dict(right, korean_text="완전히 무관한 광고 문구")
+        self.assertEqual(len(group_paragraphs([left, unrelated])), 2)
+
+    def test_numeric_warning_reaches_paragraph_json(self):
+        row = {
+            "file": "sample.pdf", "page": 1, "curved": False,
+            "korean_text": "최대 ��% 수납", "status": "수치 대조 필요 · 원본 확인",
+            "warnings": ["수치 대조 필요 · 원본 확인"],
+            "numeric_review": True, "raw_evidence_ids": ["p1:b0:l0"],
+            "native_numeric_tokens": [], "ocr_candidate": "최대 40% 수납",
+            "x0": 0, "y0": 0, "x1": 100, "y1": 12,
+            "block_id": 0, "line_id": 0, "font_size": 10,
+            "dir_x": 1, "dir_y": 0
+        }
+        result = group_paragraphs([row])[0]
+        self.assertTrue(result["numeric_review"])
+        self.assertIn("수치 대조 필요", result["status"])
+        self.assertTrue(result["warnings"])
+        self.assertEqual(result["ocr_candidates"][0]["text"], "최대 40% 수납")
+        self.assertEqual(result["raw_evidence_ids"], ["p1:b0:l0"])
+        self.assertEqual(len(result["source_coordinates"]), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,734 @@
+"""P1 unit and regression tests using synthetic text only."""
+import io
+import json
+import unittest
+from zipfile import ZipFile
+
+from phrase_matcher import match_phrases
+from rule_engine import evaluate_rules, summarize_matches
+from condition_engine import evaluate_conditions
+from bilingual_engine import evaluate_bilingual
+from symbol_detector import inspect_symbols
+from qa_report import export_p1
+from reviewer_table import reviewer_html_table, COLUMNS
+from english_pairing import find_english_counterpart
+from ui_labels import product_title, product_labels, display_file_table, readable_ocr_review, readable_group, readable_row
+from ocr_review import combine_damaged_coating, combine_damaged_attribution, recover_damaged_warranty
+from unittest.mock import patch
+import fitz
+from embedded_reference import load_master
+from layout import ensure_group_coverage
+from pdf_overlay import collect_boxes
+
+
+def master():
+    phrases=[
+        ("P1","열원","인덕션 사용 가능","ALL HOBS + INDUCTION","R1"),
+        ("P2","열원","인덕션 사용 불가","ALL HOBS EXCEPT INDUCTION","R1"),
+        ("P3","품질","최대 40% 수납 공간 절약","UP TO 40% SPACE SAVING","R2"),
+        ("P4","주의사항","사용 시 주의하세요","CAUTION","R3"),
+        ("P5","주의사항","제품을 세척하세요","WASH","R3"),
+    ]
+    return {
+        "phrases":[dict(phrase_id=p,category_id=c,korean_original=k,
+                        english_original=e,approval_status="UNVERIFIED",
+                        source_row=i+10) for i,(p,c,k,e,r) in enumerate(phrases)],
+        "variants":[dict(phrase_id=p,rule_id=r,applicability="") for p,c,k,e,r in phrases],
+        "rules":[
+            dict(rule_id="R1",category="열원",rule_type="EXACTLY_ONE",
+                 min_count=1,max_count=1,condition_expression="X=1"),
+            dict(rule_id="R2",category="품질",rule_type="AT_LEAST_ONE",
+                 min_count=1,max_count=None,condition_expression="X>=1"),
+            dict(rule_id="R3",category="주의사항",rule_type="ALL_REQUIRED",
+                 min_count=2,max_count=2,condition_expression="ALL"),
+            dict(rule_id="R4",category="재활용",rule_type="CONDITIONAL",
+                 min_count=1,max_count=1,condition_expression="logo exists"),
+        ],
+    }
+
+
+def group(text,page=1,damage=False):
+    return dict(file="example.pdf",page=page,paragraph=text,numeric_review=damage,
+                line_indices=[0],source_coordinates=[
+                    dict(bbox=[10,10,90,25],page=page,line_index=0)])
+
+
+class WarrantyVisibilityTests(unittest.TestCase):
+    def warranty_sample(self):
+        text=("테팔은 모든 제조 과정 중의 결함에 대하여 구입일로부터 "
+              "�년간 품질 보증 제도를 실시합니다. 제품 내부와 외부에 생긴 "
+              "스크래치 또는 사용 중 발생한 변색과 얼룩 등은 해당되지 않습니다.")
+        return dict(
+            file="example.pdf",page=1,paragraph=text,type="일반 문구",
+            line_indices=[0,1,2],line_count=3,
+            source_coordinates=[
+                {"page":1,"line_index":i,"bbox":[902,729+i*9,1135,753+i*9]}
+                for i in range(3)],
+            raw_evidence_ids=["a","b","c"],ocr_candidates=[],warnings=[],
+            numeric_review=True,status="수치 대조 필요 · 원본 확인",
+        )
+
+    def test_warranty_year_restoration_stays_in_both_views(self):
+        document=fitz.open()
+        document.new_page(width=1178,height=2480)
+        pdf=document.tobytes()
+        document.close()
+        original=self.warranty_sample()
+        with patch("ocr_review._ocr_warranty_year",return_value="2"):
+            groups=recover_damaged_warranty([original],{"example.pdf":pdf})
+        self.assertEqual(len(groups),1)
+        self.assertIn("2년간 품질 보증",groups[0]["paragraph"])
+        self.assertNotIn("�",readable_group(groups[0]))
+        self.assertIn("�년간",groups[0]["original_paragraph"])
+        source_line=dict(korean_text="�년간 품질 보증 제도를 실시합니다.",
+                         status="수치 대조 필요 · 원본 확인",ocr_candidate="")
+        self.assertIn("2년간",readable_row(source_line,groups[0]))
+        source_rows=[]
+        for i,part in enumerate([
+            "테팔은 모든 제조 과정 중의 결함에 대하여 구입일로부터",
+            "�년간 품질 보증 제도를 실시합니다.",
+            "스크래치 또는 사용 중 발생한 변색과 얼룩 등은 해당되지 않습니다."
+        ]):
+            source_rows.append(dict(
+                file="example.pdf",page=1,korean_text=part,
+                status="수치 대조 필요 · 원본 확인",ocr_candidate="",
+                x0=902,y0=729+i*9,x1=1135,y1=753+i*9,
+                numeric_review=True,curved=False,raw_evidence_ids=[]
+            ))
+        view=collect_boxes(source_rows,groups,[],"example.pdf",1,group_view=True)
+        self.assertEqual(len(view),1)
+        self.assertIn("2년간",view[0]["label"])
+        self.assertNotIn("�",view[0]["label"])
+        lines=collect_boxes(source_rows,groups,[],"example.pdf",1,group_view=False)
+        self.assertIn("2년간",lines[1]["label"])
+        self.assertNotIn("�",lines[1]["label"])
+        self.assertEqual(groups[0]["line_indices"],[0,1,2])
+
+    def test_unreadable_sentence_not_replaced_with_blank_message(self):
+        phrase="제품 내부와 외부에 �긴 스크래치 등이 있습니다."
+        shown=readable_ocr_review({"extracted":phrase,
+                                   "status":"OCR_REVIEW","ocr_candidates":[]})
+        self.assertEqual(shown,"제품 내부와 외부에 □긴 스크래치 등이 있습니다.")
+        self.assertNotEqual(shown,"원본 문구 확인 필요")
+
+    def test_missing_layout_line_is_recovered_without_duplicate(self):
+        raw=[
+            dict(file="example.pdf",page=1,korean_text="첫 번째 문구",
+                 x0=1,y0=1,x1=40,y1=12),
+            dict(file="example.pdf",page=1,korean_text="빠졌던 한국어 문구",
+                 x0=1,y0=20,x1=75,y1=31),
+        ]
+        grouped=[dict(file="example.pdf",page=1,paragraph="첫 번째 문구",
+                      line_indices=[0])]
+        corrected=ensure_group_coverage(grouped,raw)
+        self.assertEqual(len(corrected),2)
+        self.assertEqual(corrected[1]["paragraph"],"빠졌던 한국어 문구")
+        self.assertEqual({i for g in corrected for i in g["line_indices"]},
+                         {0,1})
+        self.assertEqual(len(ensure_group_coverage(corrected,raw)),2)
+
+
+class DamagedCoatingReviewTests(unittest.TestCase):
+    def test_ocr_coating_forms_one_review_item_and_keeps_native_evidence(self):
+        doc=fitz.open()
+        doc.new_page(width=900,height=1800)
+        content=doc.tobytes()
+        doc.close()
+        texts=["테팔�기본�코팅�대비�최대", "�배�더�오래가는",
+               "엑스트라�라이프�논스틱�코팅"]
+        rows=[{"file":"sample.pdf","page":1,"dir_x":-1.0} for _ in range(3)]
+        groups=[]
+        for i,text in enumerate(texts):
+            groups.append({
+                "file":"sample.pdf","page":1,"paragraph":text,
+                "line_indices":[i],"line_count":1,
+                "status":"수치 대조 필요","numeric_review":True,
+                "source_coordinates":[{"page":1,"line_index":i,
+                                       "bbox":[320,1340+i*11,420,1362+i*11]}],
+                "raw_evidence_ids":[f"p1:b{i}:l0"],
+                "numeric_tokens":[],"ocr_candidates":[],"warnings":[]
+            })
+        reading=("테팔 기본 코팅 대비 최대 4배 더 오래가는 "
+                 "엑스트라 라이프 논스틱 코팅")
+        with patch("ocr_review._ocr_coating",return_value=reading):
+            result=combine_damaged_coating(groups,rows,{"sample.pdf":content})
+        self.assertEqual(len(result),1)
+        self.assertEqual(result[0]["paragraph"],reading)
+        self.assertEqual(result[0]["original_paragraph"]," / ".join(texts))
+        self.assertTrue(result[0]["numeric_review"])
+        self.assertTrue(result[0]["ocr_reconstructed"])
+        self.assertEqual(len(result[0]["source_coordinates"]),3)
+        self.assertEqual([g["paragraph"] for g in groups],texts)
+        match=match_phrases(result,master())[0]
+        self.assertEqual(match["status"],"OCR_REVIEW")
+        self.assertEqual(match["original_extracted"]," / ".join(texts))
+
+    def test_no_ocr_result_does_not_invent_digit_or_join_groups(self):
+        doc=fitz.open()
+        doc.new_page(width=900,height=1800)
+        payload=doc.tobytes()
+        doc.close()
+        groups=[
+            {"file":"sample.pdf","page":1,"paragraph":t,
+             "line_indices":[i],"source_coordinates":[{"bbox":
+                    [320,1340+i*11,420,1362+i*11]}]}
+            for i,t in enumerate(["테팔�기본�코팅�대비�최대","�배�더�오래가는",
+                                  "엑스트라�라이프�논스틱�코팅"])
+        ]
+        rows=[dict(dir_x=-1.0) for _ in range(3)]
+        with patch("ocr_review._ocr_coating",return_value=None):
+            result=combine_damaged_coating(groups,rows,{"sample.pdf":payload})
+        self.assertEqual(result,groups)
+
+
+class EuromonitorOCRReviewTests(unittest.TestCase):
+    def test_fragmented_2026_2025_attribution_is_one_review_entry(self):
+        doc=fitz.open()
+        doc.new_page(width=1300,height=1800)
+        pdf=doc.tobytes()
+        doc.close()
+        texts=[
+            "테팔 세계판매 �위 주방용품. Euromonitor International Limited, Home and Garden 2026",
+            "에디션, 주방용품 카테고리 브랜드 매출, ���� 기준",
+        ]
+        groups=[{
+            "file":"sample.pdf","page":1,"paragraph":value,
+            "line_indices":[i],"line_count":1,"warnings":[],
+            "source_coordinates":[{"bbox":[700,1400+9*i,930,1420+9*i]}],
+            "ocr_candidates":[],"raw_evidence_ids":[str(i)],
+            "numeric_tokens":[],
+        } for i,value in enumerate(texts)]
+        with patch("ocr_review._ocr_attribution",return_value=("2026","2025")):
+            final=combine_damaged_attribution(groups,{"sample.pdf":pdf})
+        self.assertEqual(len(final),1)
+        self.assertIn("세계판매 1위",final[0]["paragraph"])
+        self.assertIn("2025 기준",final[0]["paragraph"])
+        self.assertTrue(final[0]["numeric_review"])
+        self.assertIn("����",final[0]["original_paragraph"])
+        with patch("ocr_review._ocr_attribution",return_value=None):
+            no_ocr=combine_damaged_attribution(groups,{"sample.pdf":pdf})
+        self.assertEqual(no_ocr,groups)
+
+
+class LongPhraseTableTests(unittest.TestCase):
+    def test_long_bilingual_phrase_is_fully_visible_and_category_is_merged(self):
+        korean=("테팔은 모든 제조 과정 중의 결함에 대하여 구입일로부터 2년간 "
+                "품질 보증 제도를 실시합니다. 제품 내부와 외부에 생긴 스크래치 "
+                "또는 사용 중 발생한 변색과 얼룩 등은 해당되지 않습니다.")
+        english="ALL HOBS + INDUCTION"
+        row={
+            "문구 카테고리": "품질 보증 / 사용법",
+            "국문 추출 문구": korean,
+            "영문 추출 문구": english,
+            "문구 유형": "수치 포함",
+            "대조 결과": "기준 문구 일치",
+            "기준 국문": korean,
+            "기준 영문": english,
+            "확인할 사항": "",
+        }
+        html=reviewer_html_table([row])
+        self.assertIn(korean,html)
+        self.assertEqual(html.count(korean),2)
+        self.assertIn('rowspan="2"',html)
+        self.assertEqual(html.count('rowspan="2"'),4)
+        self.assertLess(html.index("<th>문구 카테고리</th>"),html.index("<th>언어</th>"))
+        self.assertIn("table-layout:fixed",html)
+        self.assertIn("overflow-wrap:anywhere",html)
+        self.assertNotIn("<th>페이지</th>",html)
+        self.assertEqual(sum(width for _,width in COLUMNS),100)
+
+    def test_missing_pdf_english_is_not_filled_from_workbook(self):
+        html=reviewer_html_table([{
+            "문구 카테고리":"G7 특장점",
+            "국문 추출 문구":"엑스트라 라이프 논스틱 코팅",
+            "영문 추출 문구":"",
+            "기준 국문":"엑스트라 라이프 논스틱 코팅",
+            "기준 영문":"EXTRA-LIFE NON-STICK",
+        }])
+        self.assertIn("연결된 영문 문구 미확인",html)
+        self.assertEqual(html.count("EXTRA-LIFE NON-STICK"),1)
+
+    def test_html_escapes_untrusted_pdf_content(self):
+        html=reviewer_html_table([{
+            "국문 추출 문구": '<script>alert("x")</script>',
+            "영문 추출 문구": '<img src=x onerror=alert(1)>',
+            "문구 카테고리":"미분류"
+        }])
+        self.assertIn("&lt;script&gt;",html)
+        self.assertIn("&lt;img",html)
+        self.assertNotIn('<script>alert("x")</script>',html)
+
+
+class EnglishEvidenceTests(unittest.TestCase):
+    def test_unregistered_korean_sturdy_handle_links_actual_printed_english(self):
+        match={"file":"mint.pdf","page":1,"extracted":"무거운 무게에도 안정적인 견고한 손잡이",
+               "reference_english":""}
+        evidence=[{"file":"mint.pdf","page":1,"raw_evidence":[
+            {"text":"UP TO 100KG - ROBUST HANDLE","bbox":[800,481,1019,503]}
+        ]}]
+        self.assertEqual(find_english_counterpart(match,evidence),
+                         "UP TO 100KG - ROBUST HANDLE")
+
+    def test_unregistered_korean_three_times_coating_has_printed_english(self):
+        match={"file":"mint.pdf","page":1,
+               "extracted":"테팔 기본 코팅 대비 최대 3배 더 오래가는 코팅",
+               "reference_english":""}
+        evidence=[{"file":"mint.pdf","page":1,"raw_evidence":[
+            {"text":"UP TO","bbox":[959,753,976,763]},
+            {"text":"3X ","bbox":[955,745,1050,834]},
+            {"text":"MORE RESISTANT THAN TEFAL BASIC COATING",
+             "bbox":[927,819,1072,829]},
+        ]}]
+        self.assertEqual(find_english_counterpart(match,evidence),
+                         "UP TO 3X MORE RESISTANT THAN TEFAL BASIC COATING")
+
+    def test_unregistered_korean_saucepan_lid_is_pdf_backed(self):
+        match={"file":"mint.pdf","page":1,
+               "extracted":"편수냄비(뚜껑포함)","reference_english":""}
+        evidence=[{"file":"mint.pdf","page":1,"raw_evidence":[
+            {"text":"SAUCEPAN WITH LID ","bbox":[967,955,1031,965]},
+        ]}]
+        self.assertEqual(find_english_counterpart(match,evidence),
+                         "SAUCEPAN WITH LID")
+
+    def test_unregistered_hint_never_invents_missing_english(self):
+        match={"file":"mint.pdf","page":1,
+               "extracted":"무거운 무게에도 안정적인 견고한 손잡이",
+               "reference_english":""}
+        evidence=[{"file":"mint.pdf","page":1,"raw_evidence":[
+            {"text":"EASY TO USE","bbox":[800,481,1019,503]},
+        ]}]
+        self.assertEqual(find_english_counterpart(match,evidence),"")
+
+    def test_mint_real_printed_space_claim_uses_five_native_objects(self):
+        # Mint Calm PDF splits one visible claim into FIVE independent glyphs.
+        match={"file":"mint.pdf","page":1,
+               "reference_english":"UP TO 40% SPACE SAVING(1)"}
+        summary=[{"file":"mint.pdf","page":1,"raw_evidence":[
+            {"text":"UP TO ","bbox":[814,825,832,834]},
+            {"text":"40%","bbox":[839,788,898,844]},
+            {"text":"SPACE ","bbox":[813,824,905,880]},
+            {"text":"SAVING","bbox":[813,858,900,907]},
+            {"text":"(1)","bbox":[900,869,909,884]},
+            {"text":"3X MORE RESISTANT","bbox":[927,819,1072,829]},
+        ]}]
+        self.assertEqual(find_english_counterpart(match,summary),
+                         "UP TO 40% SPACE SAVING (1)")
+
+    def test_mint_real_printed_footnote_whitespace_and_zero_width(self):
+        reference=("(1)Tested on 3 saucepans, 1 sautepan/shallow, "
+                   "between a previous Tefal range and a new generation range\u200b")
+        printed=("(1) Tested on 3 saucepans, 1 sautepan/shallow, "
+                 "between a previous Tefal range and a new generation range ")
+        summary=[{"file":"mint.pdf","page":1,"raw_evidence":[
+            {"text":printed,"bbox":[1430,1079,1665,1088]}
+        ]}]
+        self.assertEqual(find_english_counterpart({
+            "file":"mint.pdf","page":1,"reference_english":reference},summary),
+            printed.strip())
+
+    def test_mint_real_euromonitor_two_lines_with_other_language_suffix(self):
+        reference=("Tefal world N°1 in cookware. Source : Euromonitor "
+                   "International Limited, Home and Garden 202X edition, "
+                   "brand retail value RSP, 202X data.")
+        summary=[{"file":"mint.pdf","page":1,"raw_evidence":[
+            {"text":"**Tefal world N°1 in cookware. Source : Euromonitor International Limited, Home and Garden 2026 edition, brand retail ",
+             "bbox":[464,943,707,950]},
+            {"text":"value RSP, 2025 data. / Tefal Perkakas memasak No.1 di dunia. Sumber: Euromonitor International Limited, edisi Home ",
+             "bbox":[464,950,707,957]},
+        ]}]
+        found=find_english_counterpart(
+            {"file":"mint.pdf","page":1,"reference_english":reference},summary)
+        self.assertIn("Home and Garden 2026 edition",found)
+        self.assertTrue(found.endswith("2025 data."))
+        self.assertNotIn("Perkakas",found)
+
+    def test_english_rotated_caption_in_reverse_vertical_order(self):
+        # Actual EXPERTISE RUBY artwork: first text object is lower than
+        # the following "made to last" text object.
+        match={"file":"ruby.pdf","page":1,
+               "reference_english":"Scratch-resistant, made to last"}
+        summary=[{"file":"ruby.pdf","page":1,"raw_evidence":[
+            {"text":"Scratch-resistant, ","bbox":[306,2020,485,2043]},
+            {"text":"made to last","bbox":[371,1999,485,2023]},
+            {"text":"TOUS FEUX + INDUCTION","bbox":[225,425,388,443]}
+        ]}]
+        self.assertEqual(find_english_counterpart(match,summary),
+                         "Scratch-resistant, made to last")
+
+    def test_wrapped_three_line_source_matches_variable_years(self):
+        english=("Tefal world N°1 in cookware. Source : Euromonitor "
+                 "International Limited, Home and Garden 202X edition, "
+                 "brand retail value RSP, 202X data.")
+        summary=[{"file":"mint.pdf","page":1,"raw_evidence":[
+            {"text":"**Tefal world N°1 in cookware. Source : Euromonitor ",
+             "bbox":[516,1077,802,1085]},
+            {"text":"International Limited, Home and Garden 2026 edition, ",
+             "bbox":[516,1085,802,1093]},
+            {"text":"brand retail value RSP, 2025 data. / Tefal Malay",
+             "bbox":[516,1093,802,1101]},
+        ]}]
+        result=find_english_counterpart(
+            {"file":"mint.pdf","page":1,"reference_english":english},summary)
+        self.assertIn("Home and Garden 2026",result)
+        self.assertIn("2025 data.",result)
+        self.assertNotIn("Malay",result)
+
+    def test_reference_years_are_not_assumed_equal(self):
+        ref=("Tefal world N°1 in cookware. Source : Euromonitor "
+             "International Limited, Home and Garden 202X edition, "
+             "brand retail value RSP, 202X data.")
+        summary=[{"file":"mint.pdf","page":1,"raw_evidence":[
+            {"text":ref.replace("202X edition","2026 edition")
+                        .replace("202X data","2025 data"),"bbox":[10,10,200,30]}
+        ]}]
+        self.assertIn("2025 data",find_english_counterpart(
+            {"file":"mint.pdf","page":1,"reference_english":ref},summary))
+
+    def test_english_split_over_three_native_objects(self):
+        summary=[{"file":"mint.pdf","page":1,"raw_evidence":[
+            {"text":"Get the best use &","bbox":[813,1766,879,1777]},
+            {"text":"care","bbox":[813,1776,850,1787]},
+            {"text":"advice","bbox":[813,1787,860,1797]},
+        ]}]
+        found=find_english_counterpart(
+            {"file":"mint.pdf","page":1,
+             "reference_english":"Get the best use & care advice"},summary)
+        self.assertEqual(found,"Get the best use & care advice")
+
+    def test_do_not_join_distant_english_blocks(self):
+        summary=[{"file":"x.pdf","page":1,"raw_evidence":[
+            {"text":"Scratch-resistant,","bbox":[10,20,100,33]},
+            {"text":"made to last","bbox":[350,850,470,865]},
+        ]}]
+        self.assertEqual(find_english_counterpart(
+            {"file":"x.pdf","page":1,
+             "reference_english":"Scratch-resistant, made to last"},summary),"")
+
+    def test_reference_hyphen_differs_from_pdf_but_observed_copy_shown(self):
+        match={
+            "file":"test.pdf","page":1,
+            "reference_english":"EXTRA-LIFE NON-STICK",
+        }
+        summaries=[{"file":"test.pdf","page":1,"raw_evidence":[
+            {"text":"EXTRA LIFE NON-STICK","bbox":[12,20,150,30]},
+            {"text":"ANTIADHÉSIF EXTRA LIFE","bbox":[400,20,600,30]},
+        ]}]
+        self.assertEqual(find_english_counterpart(match,summaries),
+                         "EXTRA LIFE NON-STICK")
+
+    def test_pdf_missing_english_never_uses_master_value(self):
+        match={"file":"test.pdf","page":1,
+               "reference_english":"ALL HOBS + INDUCTION"}
+        summaries=[{"file":"test.pdf","page":1,"raw_evidence":[
+            {"text":"TOUS FEUX + INDUCTION","bbox":[12,20,150,30]}
+        ]}]
+        self.assertEqual(find_english_counterpart(match,summaries),"")
+
+    def test_original_english_phrase_found_only_in_correct_document(self):
+        match={"file":"a.pdf","page":1,
+               "reference_english":"ALL HOBS + INDUCTION"}
+        summaries=[
+            {"file":"a.pdf","page":1,"raw_evidence":[
+                {"text":"ALL HOBS + INDUCTION","bbox":[10,20,150,30]}
+            ]},
+            {"file":"b.pdf","page":1,"raw_evidence":[
+                {"text":"ALL HOBS EXCEPT INDUCTION","bbox":[10,20,150,30]}
+            ]},
+        ]
+        self.assertEqual(find_english_counterpart(match,summaries),
+                         "ALL HOBS + INDUCTION")
+
+    def test_english_with_reference_or_korean_is_not_invented(self):
+        match={"file":"a.pdf","page":1,
+               "reference_english":"RECYCLABLE METAL or 재활용 가능"}
+        summaries=[{"file":"a.pdf","page":1,"raw_evidence":[
+            {"text":"RECYCLABLE METAL","bbox":[10,20,150,30]}
+        ]}]
+        self.assertEqual(find_english_counterpart(match,summaries),"RECYCLABLE METAL")
+
+class ReviewerDisplayTests(unittest.TestCase):
+    def test_pdf_derived_label_and_duplicate_disambiguation(self):
+        meta = [
+            dict(file="very_long_private_filename_a.pdf", range_name="Mint Calm",
+                 product_type_standard="SAUCEPAN", size_cm=16),
+            dict(file="very_long_private_filename_b.pdf", range_name="Mint Calm",
+                 product_type_standard="SAUCEPAN", size_cm=16),
+        ]
+        self.assertEqual(product_title(meta[0]), "Mint Calm · 편수냄비 · 16cm")
+        mapping = product_labels(meta, [x["file"] for x in meta])
+        self.assertNotEqual(mapping[meta[0]["file"]], mapping[meta[1]["file"]])
+        self.assertNotIn(".pdf", mapping[meta[0]["file"]])
+        original = [{"file": meta[0]["file"], "status": "OK"}]
+        shown = display_file_table(original, mapping)
+        self.assertEqual(shown[0]["제품"], mapping[meta[0]["file"]])
+        self.assertNotIn("file", shown[0])
+        self.assertEqual(original[0]["file"], meta[0]["file"])
+
+    def test_ocr_candidate_is_labeled_and_source_is_untouched(self):
+        row={
+            "status":"OCR_REVIEW",
+            "extracted":"쉬운�요리를�위한�강력한�코팅, 가벼운�무게",
+            "ocr_candidates":[{"text":"쉬운 요리를 위한 강력한 코팅, 가벼운 무게"}],
+        }
+        shown=readable_ocr_review(row)
+        self.assertNotIn("OCR",shown)
+        self.assertIn("쉬운 요리를 위한",shown)
+        self.assertIn("\ufffd",row["extracted"])
+        unconfirmed=dict(row,ocr_candidates=[{"text":"불확실"}])
+        self.assertEqual(readable_ocr_review(unconfirmed),"쉬운□요리를□위한□강력한□코팅, 가벼운□무게")
+
+
+    def test_unknown_label_does_not_guess_from_filename(self):
+        mapping = product_labels([dict(file="Casserole_18cm_foo.pdf",
+                                      range_name=None,
+                                      product_type_standard="UNKNOWN",
+                                      size_cm=None)], ["Casserole_18cm_foo.pdf"])
+        self.assertEqual(mapping["Casserole_18cm_foo.pdf"], "제품정보 확인 필요")
+
+
+class EmbeddedReferenceIntegrationTests(unittest.TestCase):
+    def test_real_reference_can_match_without_workbook_upload(self):
+        source=load_master()
+        self.assertGreaterEqual(len(source["phrases"]),200)
+        sample=next(p for p in source["phrases"]
+                    if p.get("korean_original") and len(p["korean_original"])>=12)
+        entry=group(sample["korean_original"])
+        matched=match_phrases([entry],source)
+        self.assertEqual(len(matched),1)
+        self.assertIn(matched[0]["status"],
+                      ("EXACT_MATCH","AMBIGUOUS_MATCH"))
+        self.assertEqual(matched[0]["extracted"],sample["korean_original"])
+        rules=evaluate_rules(matched,source,"example.pdf")
+        self.assertEqual(len(rules),len(source["rules"]))
+
+class PhraseMatcherTests(unittest.TestCase):
+    def test_exact(self):
+        x=match_phrases([group("인덕션 사용 가능")],master())[0]
+        self.assertEqual(x["status"],"EXACT_MATCH")
+        self.assertEqual(x["phrase_id"],"P1")
+        self.assertEqual(x["approval_status"],"UNVERIFIED")
+        self.assertEqual(len(x["source_coordinates"]),1)
+
+    def test_whitespace_and_numeric(self):
+        x=match_phrases([group("최대 40 % 수납 공간 절약")],master())[0]
+        self.assertEqual(x["status"],"NORMALIZED_MATCH")
+        x=match_phrases([group("최대 30% 수납 공간 절약")],master())[0]
+        self.assertEqual(x["status"],"NUMERIC_MISMATCH")
+        self.assertEqual(x["phrase_id"],"P3")
+
+    def test_euromonitor_202x_years_are_independent_variables(self):
+        ref=("테팔 세계판매 1위 주방용품. Euromonitor International Limited, "
+             "Home and Garden 202X 에디션, 주방용품 카테고리 브랜드 매출, 202X 기준")
+        actual=("테팔 세계판매 1위 주방용품. Euromonitor International Limited, "
+                "Home and Garden 2026 에디션, 주방용품 카테고리 브랜드 매출, 2025 기준")
+        model=master()
+        model["phrases"].append(dict(phrase_id="P202",category_id="세계 1위",
+                                     korean_original=ref,english_original="",
+                                     approval_status="UNVERIFIED",source_row=202))
+        model["variants"].append(dict(phrase_id="P202",rule_id="R2",applicability=""))
+        result=match_phrases([group(actual)],model)[0]
+        self.assertEqual(result["status"],"VARIABLE_MATCH")
+        self.assertEqual(result["phrase_id"],"P202")
+        self.assertEqual(result["differences"],"연도 변수: 2026, 2025")
+        self.assertNotIn("불일치",result["differences"])
+        swapped=actual.replace("2026 에디션","2027 에디션").replace("2025 기준","2026 기준")
+        next_year=match_phrases([group(swapped)],model)[0]
+        self.assertEqual(next_year["status"],"VARIABLE_MATCH")
+        wrong=actual.replace("2025 기준","2015 기준")
+        self.assertNotEqual(match_phrases([group(wrong)],model)[0]["status"],"VARIABLE_MATCH")
+
+    def test_multiplier_placeholder_requires_human_range_check(self):
+        m=master()
+        m["phrases"].append(dict(
+            phrase_id="P6",category_id="특장점",
+            korean_original="최대 Y배 더 오래가는 코팅",
+            english_original="UP TO YX LONGER LASTING",
+            approval_status="UNVERIFIED",source_row=99))
+        m["variants"].append(dict(phrase_id="P6",rule_id="R2",applicability=""))
+        match=match_phrases([group("최대 3배 더 오래가는 코팅")],m)[0]
+        self.assertEqual(match["status"],"TEXT_MISMATCH")
+        self.assertEqual(match["phrase_id"],"P6")
+        self.assertEqual(match["differences"],"Y=3")
+
+    def test_numeric_damage_requires_review(self):
+        x=match_phrases([group("최대 ��% 수납 공간 절약",damage=True)],master())[0]
+        self.assertEqual(x["status"],"OCR_REVIEW")
+
+    def test_unregistered_is_never_deleted(self):
+        rows=[group("처음 출시한 제품 문구"),group("완전히 새로운 국문 광고")]
+        matches=match_phrases(rows,master())
+        self.assertEqual(len(matches),len(rows))
+        self.assertTrue(all(m["status"]=="UNREGISTERED" for m in matches))
+        self.assertEqual([m["extracted"] for m in matches],
+                         [r["paragraph"] for r in rows])
+
+    def test_damaged_warranty_with_clean_substring_requires_review(self):
+        m=master()
+        actual=("테팔은 모든 제조 과정 중의 결함에 대하여 구입일로부터 �년간 "
+                "품질 보증 제도를 실시합니다. "
+                "제품 내부와 외부에 생긴 스크래치 또는 사용 중 발생한 변색과 얼룩 등은 해당되지 않습니다.")
+        m["phrases"].append(dict(
+            phrase_id="WARRANTY", category_id="품질 보증",
+            korean_original="제품 내부와 외부에 생긴 스크래치 또는 사용 중 발생한 변색과 얼룩 등은 해당되지 않습니다.",
+            english_original="Your local statutory rights are not affected",
+            approval_status="UNVERIFIED", source_row=34,
+        ))
+        result=match_phrases([group(actual)],m)[0]
+        self.assertEqual(result["status"],"OCR_REVIEW")
+        self.assertNotIn("숫자·단위 불일치", result["differences"])
+        rules=evaluate_rules([result],m,"example.pdf")
+        self.assertNotIn(result["status"],("EXACT_MATCH","NORMALIZED_MATCH"))
+        self.assertEqual(result["extracted"],actual)
+
+    def test_clean_phrase_remains_match_after_damaged_counterpart_guard(self):
+        matched=match_phrases([group("인덕션 사용 가능")],master())[0]
+        self.assertEqual(matched["status"],"EXACT_MATCH")
+
+    def test_missing_terminal_period_is_not_qr_mismatch(self):
+        m=master()
+        m["phrases"].append(dict(
+            phrase_id="PQR",category_id="사용방법",
+            korean_original="QR 코드를 스캔하여 최적의 사용 및 관리방법을 확인하세요.",
+            english_original="Get the best use & care advice",
+            approval_status="UNVERIFIED",source_row=30
+        ))
+        r=match_phrases([group("QR 코드를 스캔하여 최적의 사용 및 관리방법을 확인하세요")],m)[0]
+        self.assertEqual(r["status"],"NORMALIZED_MATCH")
+
+    def test_broken_korean_spacing_is_not_numeric_mismatch(self):
+        m=master()
+        m["phrases"].append(dict(
+            phrase_id="PC",category_id="코팅",
+            korean_original="엑스트라 라이프 논스틱 코팅",
+            english_original="EXTRA LIFE NON-STICK",
+            approval_status="UNVERIFIED",source_row=31
+        ))
+        result=match_phrases([group("엑스트라�라이프�논스틱�코팅",damage=True)],m)[0]
+        self.assertEqual(result["status"],"OCR_REVIEW")
+        self.assertNotEqual(result["differences"],"숫자·단위 불일치")
+
+
+    def test_negation_is_not_passed(self):
+        x=match_phrases([group("인덕션 사용 불가")],master())[0]
+        self.assertEqual(x["phrase_id"],"P2")
+        self.assertNotEqual(x["phrase_id"],"P1")
+
+    def test_no_bare_short_fragment_match(self):
+        x=match_phrases([group("최대")],master())[0]
+        self.assertNotIn(x["status"],("EXACT_MATCH","NORMALIZED_MATCH"))
+
+
+class RuleTests(unittest.TestCase):
+    def test_single_variant_repeated_is_not_conflict(self):
+        rows=[group("인덕션 사용 가능"),group("인덕션 사용 가능",2)]
+        matches=match_phrases(rows,master())
+        rules=evaluate_rules(matches,master(),"example.pdf")
+        r=next(r for r in rules if r["rule_id"]=="R1")
+        self.assertEqual(r["found_occurrences"],2)
+        self.assertEqual(r["distinct_variants"],1)
+        self.assertEqual(r["status"],"OK")
+
+    def test_two_variants_fail(self):
+        matches=match_phrases([group("인덕션 사용 가능"),
+                               group("인덕션 사용 불가")],master())
+        rules=evaluate_rules(matches,master(),"example.pdf")
+        self.assertEqual(next(r for r in rules if r["rule_id"]=="R1")["status"],"FAIL")
+        self.assertEqual(next(r for r in rules if r["rule_id"]=="P1-HEAT-CONFLICT")["status"],"FAIL")
+
+    def test_missing_does_not_misreport_approved_fail(self):
+        rules=evaluate_rules([],master(),"example.pdf")
+        required=next(r for r in rules if r["rule_id"]=="R1")
+        self.assertEqual(required["status"],"REVIEW")
+        self.assertEqual(required["found_occurrences"],0)
+
+    def test_all_required_partial(self):
+        matches=match_phrases([group("사용 시 주의하세요")],master())
+        rules=evaluate_rules(matches,master(),"example.pdf")
+        self.assertEqual(next(r for r in rules if r["rule_id"]=="R3")["status"],"REVIEW")
+
+    def test_conditional_remains_review(self):
+        r=next(r for r in evaluate_rules([],master(),"example.pdf")
+               if r["rule_id"]=="R4")
+        self.assertEqual(r["applicability"],"UNDETERMINED")
+        self.assertEqual(r["status"],"REVIEW")
+
+    def test_english_heat_contradiction_without_korean(self):
+        output = evaluate_rules([], master(), "example.pdf", context={
+            "raw_pdf_text": "ALL HOBS + INDUCTION / ALL HOBS EXCEPT INDUCTION"
+        })
+        risk = next(r for r in output if r["rule_id"] == "P1-HEAT-CONFLICT")
+        self.assertEqual(risk["status"], "FAIL")
+
+    def test_warranty_scope_uncertain_requiring_review(self):
+        mm = [dict(file="example.pdf", extracted="제품 품질보증 2년"),
+              dict(file="example.pdf", extracted="스테인리스 품질보증 10년")]
+        output = evaluate_rules(mm, master(), "example.pdf")
+        risk = next(r for r in output if r["rule_id"] == "P1-WARRANTY-DURATION")
+        self.assertEqual(risk["status"], "REVIEW")
+        self.assertEqual(risk["distinct_variants"], 2)
+
+    def test_report_archives_raw_and_unregistered(self):
+        m=match_phrases([group("인덕션 사용 가능"),group("신규 문구")],master())
+        rr=evaluate_rules(m,master(),"example.pdf")
+        summary=summarize_matches(m,rr)
+        data=export_p1(m,rr,summary)
+        with ZipFile(io.BytesIO(data)) as z:
+            self.assertEqual(len(z.namelist()),7)
+            items=json.loads(z.read("p1_unregistered.json"))
+            self.assertEqual(items[0]["extracted"],"신규 문구")
+            self.assertEqual(summary[0]["unregistered_count"],1)
+
+
+class BilingualAndSymbolsTests(unittest.TestCase):
+    def test_english_found_missing_korean_is_review(self):
+        evidence=[dict(file="example.pdf", raw_evidence=[dict(
+            text="ALL HOBS EXCEPT INDUCTION")])]
+        results=evaluate_bilingual(master(), [], evidence, "example.pdf")
+        matched=next(r for r in results if r["rule_id"]=="P1-BILINGUAL-P2")
+        self.assertEqual(matched["status"],"REVIEW")
+
+    def test_bilingual_pair_found_is_ok_not_approved(self):
+        evidence=[dict(file="example.pdf", raw_evidence=[dict(
+            text="ALL HOBS EXCEPT INDUCTION")])]
+        mm=match_phrases([group("인덕션 사용 불가")],master())
+        result=evaluate_bilingual(master(), mm, evidence, "example.pdf")
+        matched=next(r for r in result if r["rule_id"]=="P1-BILINGUAL-P2")
+        self.assertEqual(matched["status"],"OK")
+        self.assertEqual(matched["approval_status"],"UNVERIFIED")
+
+    def test_symbol_absence_is_never_auto_pass(self):
+        meta=[dict(file="example.pdf",manufacturing_country="FRANCE")]
+        results=inspect_symbols([],meta)
+        self.assertTrue(results)
+        self.assertTrue(all(r["status"]=="REVIEW" for r in results))
+
+class ConditionTests(unittest.TestCase):
+    def test_france_badge_never_auto_pass(self):
+        results=evaluate_conditions([dict(file="example.pdf",
+                                         manufacturing_country="FRANCE")],[],[])
+        r=next(r for r in results if r["rule_id"]=="P1-FR-BADGE")
+        self.assertEqual(r["status"],"REVIEW")
+
+    def test_18cm_stewpot_translation_is_review(self):
+        results=evaluate_conditions([
+            dict(file="example.pdf",manufacturing_country="CHINA",
+                 product_type_standard="STEWPOT",size_cm=18,
+                 has_lid=False)
+        ],[],[])
+        result=next(r for r in results if r["rule_id"]=="P1-18CM-STEW")
+        self.assertEqual(result["status"],"REVIEW")
+        self.assertIn("뚝배기",result["finding"])
+
+    def test_english_heat_requires_korean(self):
+        summaries=[dict(file="example.pdf",raw_evidence=[
+            dict(text="ALL HOBS EXCEPT INDUCTION")
+        ])]
+        metadata=[dict(file="example.pdf",manufacturing_country="CHINA")]
+        results=evaluate_conditions(metadata,[],summaries)
+        r=next(r for r in results if r["rule_id"]=="P1-EN-KO-HEAT")
+        self.assertEqual(r["status"],"REVIEW")
+
+
+if __name__=="__main__":
+    unittest.main()
